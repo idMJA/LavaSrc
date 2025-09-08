@@ -5,6 +5,9 @@
 > [!IMPORTANT]
 > For LavaSrc v3 (Lavaplayer v1 & Lavalink v3) look [here](https://github.com/topi314/LavaSrc/tree/v3-legacy)
 
+> [!NOTE]
+> This is a private MJBA fork of the original LavaSrc project for my personal use. This project is for internal use only and will not be published or distributed to the public.
+
 ## Summary
 
 * [Sources](#sources)

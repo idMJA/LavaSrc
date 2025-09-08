@@ -34,6 +34,8 @@ public class SpotifyTokenTracker {
 
 	private static final Pattern SECRET_PATTERN = Pattern.compile("\"secret\":\\[(\\d+(?:,\\d+)+)]");
 
+	private static final String GITHUB_SECRET_URL = "https://raw.githubusercontent.com/Thereallo1026/spotify-secrets/refs/heads/main/secrets/secretBytes.json";
+
 	private final SpotifySourceManager sourceManager;
 
 	private String clientId;
@@ -211,6 +213,50 @@ public class SpotifyTokenTracker {
 	}
 
 	private byte[] requestSecret() throws IOException {
+		log.debug("Attempting to fetch secret from GitHub: {}", GITHUB_SECRET_URL);
+		try {
+			var request = new HttpGet(GITHUB_SECRET_URL);
+			var json = LavaSrcTools.fetchResponseAsJson(this.sourceManager.getHttpInterface(), request);
+			if (json != null && !json.isNull()) {
+				// pick entry with highest version if present
+				int maxVersion = Integer.MIN_VALUE;
+				int maxIndex = -1;
+				for (int i = 0;; i++) {
+					var node = json.index(i);
+					if (node == null || node.isNull()) break;
+					var versionNode = node.get("version");
+					if (versionNode != null && !versionNode.isNull()) {
+						int v = (int) versionNode.asLong(0);
+						if (v > maxVersion) {
+							maxVersion = v;
+							maxIndex = i;
+						}
+					}
+				}
+
+				var chosen = (maxIndex >= 0) ? json.index(maxIndex) : json.index(0);
+				if (chosen != null && !chosen.isNull()) {
+					var secretNode = chosen.get("secret");
+					if (secretNode != null && !secretNode.isNull()) {
+						// build byte[] by iterating until index returns null/isNull
+						List<Byte> tmp = new ArrayList<>();
+						for (int i = 0;; i++) {
+							var el = secretNode.index(i);
+							if (el == null || el.isNull()) break;
+							tmp.add((byte) el.asLong(0));
+						}
+						byte[] secretByteArray = new byte[tmp.size()];
+						for (int i = 0; i < tmp.size(); i++) secretByteArray[i] = tmp.get(i);
+						log.debug("Secret fetched from GitHub (version={})", maxVersion == Integer.MIN_VALUE ? "unknown" : maxVersion);
+						return secretByteArray;
+					}
+				}
+			}
+		} catch (IOException e) {
+			log.warn("Fetching secret from GitHub failed, falling back to scraping: {}", e.toString());
+			// continue to fallback scraping logic below
+		}
+
 		String homepageUrl = "https://open.spotify.com/";
 		String scriptPattern = "mobile-web-player";
 
