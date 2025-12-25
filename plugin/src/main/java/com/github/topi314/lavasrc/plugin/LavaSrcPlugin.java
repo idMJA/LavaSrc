@@ -82,6 +82,9 @@ public class LavaSrcPlugin implements AudioPlayerManagerConfiguration, SearchMan
 			if (spotifyConfig.getAlbumLoadLimit() > 0) {
 				this.spotify.setAlbumPageLimit(spotifyConfig.getAlbumLoadLimit());
 			}
+			if (spotifyConfig.getResolveEndpoint() != null && !spotifyConfig.getResolveEndpoint().isBlank()) {
+				this.spotify.setResolveEndpoint(spotifyConfig.getResolveEndpoint());
+			}
 			if (!spotifyConfig.isResolveArtistsInSearch()) {
 				this.spotify.setResolveArtistsInSearch(spotifyConfig.isResolveArtistsInSearch());
 			}
@@ -317,6 +320,9 @@ public class LavaSrcPlugin implements AudioPlayerManagerConfiguration, SearchMan
 			}
 			if (spotifyConfig.getCustomTokenEndpoint() != null) {
 				this.spotify.setCustomTokenEndpoint(spotifyConfig.getCustomTokenEndpoint());
+			}
+			if (spotifyConfig.getResolveEndpoint() != null) {
+				this.spotify.setResolveEndpoint(spotifyConfig.getResolveEndpoint());
 			}
 		}
 

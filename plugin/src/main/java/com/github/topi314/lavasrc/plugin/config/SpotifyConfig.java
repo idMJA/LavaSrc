@@ -17,6 +17,7 @@ public class SpotifyConfig {
 	private boolean localFiles = false;
 	private boolean preferAnonymousToken = false;
 	private String customTokenEndpoint;
+	private String resolveEndpoint;
 
 	public String getClientId() {
 		return this.clientId;
@@ -96,5 +97,13 @@ public class SpotifyConfig {
 
 	public void setCustomTokenEndpoint(String customTokenEndpoint) {
 		this.customTokenEndpoint = customTokenEndpoint;
+	}
+
+	public String getResolveEndpoint() {
+		return this.resolveEndpoint;
+	}
+
+	public void setResolveEndpoint(String resolveEndpoint) {
+		this.resolveEndpoint = resolveEndpoint;
 	}
 }

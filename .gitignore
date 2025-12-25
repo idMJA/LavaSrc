@@ -1,6 +1,7 @@
 build
 .gradle
 .idea
+.vscode
 !gradle/wrapper/gradle-wrapper.jar
 application.yml
 logs/

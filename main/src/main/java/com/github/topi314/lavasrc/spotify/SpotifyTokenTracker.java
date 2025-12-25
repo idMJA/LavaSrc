@@ -77,6 +77,14 @@ public class SpotifyTokenTracker {
 		this.expires = null;
 	}
 
+	public String getClientId() {
+		return this.clientId;
+	}
+
+	public String getClientSecret() {
+		return this.clientSecret;
+	}
+
 	public void setCustomTokenEndpoint(String customTokenEndpoint) {
 		this.customTokenEndpoint = customTokenEndpoint;
 		this.anonymousAccessToken = null;
