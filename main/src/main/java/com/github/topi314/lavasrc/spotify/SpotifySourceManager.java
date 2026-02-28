@@ -35,10 +35,9 @@ import java.math.BigInteger;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.regex.Matcher;
@@ -55,13 +54,27 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	public static final String SHARE_URL = "https://spotify.link/";
 	public static final int PLAYLIST_MAX_PAGE_ITEMS = 100;
 	public static final int ALBUM_MAX_PAGE_ITEMS = 50;
-//	public static final String API_BASE = "https://api.spotify.com/v1/";
+	//	public static final String API_BASE = "https://api.spotify.com/v1/";
 	public static final String CLIENT_API_BASE = "https://spclient.wg.spotify.com/";
 	public static final String PARTNER_API_BASE = "https://api-partner.spotify.com/pathfinder/v2/query";
 	public static final Set<AudioSearchResult.Type> SEARCH_TYPES = Set.of(AudioSearchResult.Type.ALBUM, AudioSearchResult.Type.ARTIST, AudioSearchResult.Type.PLAYLIST, AudioSearchResult.Type.TRACK);
+	private static final String BASE62_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+	private static final int METADATA_STABLE_PARALLELISM = Math.max(16, Math.min(48, Runtime.getRuntime().availableProcessors() * 4));
+	private static final int METADATA_RETRY_ATTEMPTS = 3;
+	private static final long METADATA_RETRY_BASE_DELAY_MS = 100;
 	private static final String USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.6998.178 Spotify/1.2.65.255 Safari/537.36";
 	private static final Logger log = LoggerFactory.getLogger(SpotifySourceManager.class);
+	private static final AtomicInteger METADATA_WORKER_COUNTER = new AtomicInteger(1);
 	private final HttpInterfaceManager httpInterfaceManager = HttpClientTools.createDefaultThreadLocalManager();
+	private final ExecutorService metadataLookupExecutor = Executors.newFixedThreadPool(
+		METADATA_STABLE_PARALLELISM,
+		runnable -> {
+			var thread = new Thread(runnable, "spotify-isrc-worker-" + METADATA_WORKER_COUNTER.getAndIncrement());
+			thread.setDaemon(true);
+			return thread;
+		}
+	);
+	private final Map<String, String> metadataIsrcCache = new ConcurrentHashMap<>();
 	private final SpotifyTokenTracker tokenTracker;
 	private final String countryCode;
 	private int playlistPageLimit = 6;
@@ -148,12 +161,12 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	@Override
 	@Nullable
 	public AudioLyrics loadLyrics(@NotNull AudioTrack audioTrack) {
-		var spotifyTackId = "";
+		var spotifyTrackId = "";
 		if (audioTrack instanceof SpotifyAudioTrack) {
-			spotifyTackId = audioTrack.getIdentifier();
+			spotifyTrackId = audioTrack.getIdentifier();
 		}
 
-		if (spotifyTackId.isEmpty()) {
+		if (spotifyTrackId.isEmpty()) {
 			AudioItem item = AudioReference.NO_TRACK;
 			try {
 				if (audioTrack.getInfo().isrc != null && !audioTrack.getInfo().isrc.isEmpty()) {
@@ -170,17 +183,17 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 				return null;
 			}
 			if (item instanceof AudioTrack) {
-				spotifyTackId = ((AudioTrack) item).getIdentifier();
+				spotifyTrackId = ((AudioTrack) item).getIdentifier();
 			} else if (item instanceof AudioPlaylist) {
 				var playlist = (AudioPlaylist) item;
 				if (!playlist.getTracks().isEmpty()) {
-					spotifyTackId = playlist.getTracks().get(0).getIdentifier();
+					spotifyTrackId = playlist.getTracks().get(0).getIdentifier();
 				}
 			}
 		}
 
 		try {
-			return this.getLyrics(spotifyTackId);
+			return this.getLyrics(spotifyTrackId);
 		} catch (IOException e) {
 			throw new RuntimeException(e);
 		}
@@ -339,7 +352,7 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 		}
 
 		var artists = new ArrayList<AudioPlaylist>();
-		if (types.contains(AudioSearchResult.Type.ARTIST)) {
+		if (this.resolveArtistsInSearch && types.contains(AudioSearchResult.Type.ARTIST)) {
 			for (var item : this.getPartnerSearchItems(searchData, "artists").values()) {
 				var data = this.getPartnerDataNode(item);
 				if (data.isNull()) {
@@ -572,6 +585,7 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 			totalTracks = (int) playlist.get("content").get("totalCount").asLong(totalTracks);
 			offset += PLAYLIST_MAX_PAGE_ITEMS;
 
+			var trackNodes = new ArrayList<JsonBrowser>();
 			for (var value : playlist.get("content").get("items").values()) {
 				var track = value.get("itemV2").get("data");
 				if (track.isNull()) {
@@ -586,7 +600,12 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 					continue;
 				}
 
-				tracks.add(this.parsePartnerTrack(track, preview));
+				trackNodes.add(track);
+			}
+
+			var metadataIsrcMap = this.resolveMetadataIsrcMap(trackNodes);
+			for (var trackNode : trackNodes) {
+				tracks.add(this.parsePartnerTrack(trackNode, preview, metadataIsrcMap.get(this.extractSpotifyId(trackNode.get("uri").text()))));
 			}
 
 		}
@@ -679,6 +698,7 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 
 	private List<AudioTrack> parsePartnerTrackCollection(JsonBrowser items, boolean preview) {
 		var tracks = new ArrayList<AudioTrack>();
+		var trackNodes = new ArrayList<JsonBrowser>();
 		for (var value : items.values()) {
 			var track = this.getPartnerTrackNode(value);
 			if (track.isNull()) {
@@ -693,10 +713,40 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 				continue;
 			}
 
-			tracks.add(this.parsePartnerTrack(track, preview, null));
+			trackNodes.add(track);
+		}
+
+		var metadataIsrcMap = this.resolveMetadataIsrcMap(trackNodes);
+		for (var trackNode : trackNodes) {
+			tracks.add(this.parsePartnerTrack(trackNode, preview, metadataIsrcMap.get(this.extractSpotifyId(trackNode.get("uri").text()))));
 		}
 
 		return tracks;
+	}
+
+	private Map<String, String> resolveMetadataIsrcMap(List<JsonBrowser> trackNodes) {
+		if (trackNodes.isEmpty() || !this.tokenTracker.hasValidAccountCredentials()) {
+			return Collections.emptyMap();
+		}
+
+		var trackIds = new ArrayList<String>();
+		for (var trackNode : trackNodes) {
+			var trackId = this.extractSpotifyId(trackNode.get("uri").text());
+			if (trackId != null && !trackId.isBlank()) {
+				trackIds.add(trackId);
+			}
+		}
+
+		if (trackIds.isEmpty()) {
+			return Collections.emptyMap();
+		}
+
+		try {
+			return this.getTrackIsrcsFromMetadata(trackIds);
+		} catch (Exception e) {
+			log.debug("Failed to resolve batch ISRC metadata", e);
+			return Collections.emptyMap();
+		}
 	}
 
 	private JsonBrowser getPartnerTrackNode(JsonBrowser value) {
@@ -740,12 +790,12 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	}
 
 	private JsonBrowser getPartnerPlaylistJson(String id, int offset, String market) throws IOException {
-		var variables = "{\"uri\":\"spotify:playlist:" + id + "\",\"offset\":" + offset + ",\"limit\":" + SpotifySourceManager.PLAYLIST_MAX_PAGE_ITEMS + ",\"enableWatchFeedEntrypoint\":false,\"market\":\"from_token\",\"locale\":\"\",\"textFilter\":\"\",\"includeExtendedAudioItems\":false}";
+		var variables = "{\"uri\":\"spotify:playlist:" + id + "\",\"offset\":" + offset + ",\"limit\":" + PLAYLIST_MAX_PAGE_ITEMS + ",\"enableWatchFeedEntrypoint\":false,\"market\":\"from_token\",\"locale\":\"\",\"textFilter\":\"\",\"includeExtendedAudioItems\":false}";
 		return this.getPartnerJson(PartnerQuery.GET_PLAYLIST, variables);
 	}
 
 	private JsonBrowser getPartnerAlbumJson(String id, int offset, String market) throws IOException {
-		var variables = "{\"uri\":\"spotify:album:" + id + "\",\"offset\":" + offset + ",\"limit\":" + SpotifySourceManager.ALBUM_MAX_PAGE_ITEMS + ",\"market\":\"from_token\"}";
+		var variables = "{\"uri\":\"spotify:album:" + id + "\",\"offset\":" + offset + ",\"limit\":" + ALBUM_MAX_PAGE_ITEMS + ",\"market\":\"from_token\"}";
 		return this.getPartnerJson(PartnerQuery.GET_ALBUM, variables);
 	}
 
@@ -761,7 +811,7 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 
 	private JsonBrowser getPartnerSearchJson(String query, int limit, String market) throws IOException {
 		var escapedQuery = query.replace("\\", "\\\\").replace("\"", "\\\"");
-		var variables = "{\"searchTerm\":\"" + escapedQuery + "\",\"offset\":" + 0 + ",\"limit\":" + limit + ",\"numberOfTopResults\":5,\"includeAudiobooks\":false,\"includeArtistHasConcertsField\":false,\"includeLocalConcertsField\":false,\"includePreReleases\":false,\"includeLocalMusic\":false,\"market\":\"from_token\"}";
+		var variables = "{\"searchTerm\":\"" + escapedQuery + "\",\"offset\":0,\"limit\":" + limit + ",\"numberOfTopResults\":5,\"includeAudiobooks\":false,\"includeArtistHasConcertsField\":false,\"includeLocalConcertsField\":false,\"includePreReleases\":false,\"includeLocalMusic\":false,\"market\":\"from_token\"}";
 		return this.getPartnerJson(PartnerQuery.SEARCH_DESKTOP, variables);
 	}
 
@@ -887,10 +937,6 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 		return LavaSrcTools.fetchResponseAsJson(this.httpInterfaceManager.getInterface(), request);
 	}
 
-	private AudioTrack parsePartnerTrack(JsonBrowser json, boolean preview) {
-		return this.parsePartnerTrack(json, preview, null);
-	}
-
 	private AudioTrack parsePartnerTrack(JsonBrowser json, boolean preview, String fallbackIsrc) {
 		var uri = json.get("uri").text();
 		var trackId = this.extractSpotifyId(uri);
@@ -967,13 +1013,17 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	}
 
 	private String getTrackIsrcFromMetadata(String trackId) throws IOException {
+		return this.getTrackIsrcFromMetadata(trackId, this.getMetadataAccessToken());
+	}
+
+	private String getTrackIsrcFromMetadata(String trackId, String metadataAccessToken) throws IOException {
 		var gid = this.toSpotifyGid(trackId);
 		if (gid == null) {
 			return null;
 		}
 
 		var request = new HttpGet(CLIENT_API_BASE + "metadata/4/track/" + gid + "?market=from_token");
-		request.setHeader("Authorization", "Bearer " + this.tokenTracker.getAccountAccessToken());
+		request.setHeader("Authorization", "Bearer " + metadataAccessToken);
 		request.setHeader("Accept", "application/json");
 		request.setHeader("Origin", "open.spotify.com");
 		request.setHeader("Referer", "open.spotify.com");
@@ -984,6 +1034,89 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 		}
 
 		return this.extractIsrcFromMetadata(metadata);
+	}
+
+	private String getTrackIsrcFromMetadataWithRetry(String trackId, String metadataAccessToken) throws IOException {
+		return this.getTrackIsrcFromMetadataWithRetry(trackId, metadataAccessToken, 1);
+	}
+
+	private String getTrackIsrcFromMetadataWithRetry(String trackId, String metadataAccessToken, int attempt) throws IOException {
+		try {
+			return this.getTrackIsrcFromMetadata(trackId, metadataAccessToken);
+		} catch (IOException exception) {
+			if (attempt >= METADATA_RETRY_ATTEMPTS) {
+				throw exception;
+			}
+
+			try {
+				Thread.sleep(METADATA_RETRY_BASE_DELAY_MS * attempt);
+			} catch (InterruptedException interruptedException) {
+				Thread.currentThread().interrupt();
+				var interruptedIOException = new IOException("Interrupted while retrying metadata request", interruptedException);
+				interruptedIOException.addSuppressed(exception);
+				throw interruptedIOException;
+			}
+
+			return this.getTrackIsrcFromMetadataWithRetry(trackId, metadataAccessToken, attempt + 1);
+		}
+	}
+
+	private Map<String, String> getTrackIsrcsFromMetadata(List<String> trackIds) throws IOException {
+		if (trackIds.isEmpty()) {
+			return Collections.emptyMap();
+		}
+
+		var uniqueTrackIds = new LinkedHashSet<>(trackIds);
+		var resolved = new HashMap<String, String>();
+		var unresolved = new LinkedHashSet<String>();
+
+		for (var trackId : uniqueTrackIds) {
+			var cached = this.metadataIsrcCache.get(trackId);
+			if (cached == null) {
+				unresolved.add(trackId);
+				continue;
+			}
+
+			if (!cached.isBlank()) {
+				resolved.put(trackId, cached);
+			}
+		}
+
+		if (unresolved.isEmpty()) {
+			return resolved;
+		}
+
+		var metadataAccessToken = this.getMetadataAccessToken();
+		var futures = new LinkedHashMap<String, CompletableFuture<String>>();
+
+		for (var trackId : unresolved) {
+			futures.put(trackId, CompletableFuture.supplyAsync(() -> {
+				try {
+					return this.getTrackIsrcFromMetadataWithRetry(trackId, metadataAccessToken);
+				} catch (IOException e) {
+					throw new RuntimeException(e);
+				}
+			}, this.metadataLookupExecutor));
+		}
+
+		for (var entry : futures.entrySet()) {
+			var trackId = entry.getKey();
+			try {
+				var isrc = entry.getValue().join();
+				if (isrc == null || isrc.isBlank()) {
+					this.metadataIsrcCache.putIfAbsent(trackId, "");
+					continue;
+				}
+
+				resolved.put(trackId, isrc);
+				this.metadataIsrcCache.put(trackId, isrc);
+			} catch (Exception e) {
+				log.debug("Failed to fetch single metadata ISRC for {}", trackId, e);
+				this.metadataIsrcCache.putIfAbsent(trackId, "");
+			}
+		}
+
+		return resolved;
 	}
 
 	private String extractIsrcFromMetadata(JsonBrowser metadata) {
@@ -1032,10 +1165,9 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 			return null;
 		}
 
-		final String alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
 		BigInteger value = BigInteger.ZERO;
 		for (var c : base62Id.toCharArray()) {
-			var index = alphabet.indexOf(c);
+			var index = BASE62_ALPHABET.indexOf(c);
 			if (index < 0) {
 				return null;
 			}
@@ -1053,6 +1185,14 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 		}
 
 		return null;
+	}
+
+	private String getMetadataAccessToken() throws IOException {
+		if (!this.tokenTracker.hasValidAccountCredentials()) {
+			throw new IllegalArgumentException("Spotify spDc must be set");
+		}
+
+		return this.tokenTracker.getAccountAccessToken();
 	}
 
 	private String extractSpotifyId(String uri) {
@@ -1096,8 +1236,15 @@ public class SpotifySourceManager extends MirroringAudioSourceManager implements
 	@Override
 	public void shutdown() {
 		try {
+			this.metadataLookupExecutor.shutdown();
+			if (!this.metadataLookupExecutor.awaitTermination(2, TimeUnit.SECONDS)) {
+				this.metadataLookupExecutor.shutdownNow();
+			}
 			this.httpInterfaceManager.close();
-		} catch (IOException e) {
+		} catch (IOException | InterruptedException e) {
+			if (e instanceof InterruptedException) {
+				Thread.currentThread().interrupt();
+			}
 			log.error("Failed to close HTTP interface manager", e);
 		}
 	}
